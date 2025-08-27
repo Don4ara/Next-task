@@ -7,6 +7,13 @@
   ],
   "permissions": [
     "core:default",
-    "updater:default"
+    "updater:default",
+    "log:default",
+
+    "updater:default",
+    "updater:allow-check",
+
+    "dialog:default",
+    "dialog:allow-message"
   ]
 }

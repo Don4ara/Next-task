@@ -1,11 +1,13 @@
-name: Release Tauri on main
+name: Release Tauri updates (public repo)
 
 on:
+  workflow_dispatch:
   push:
-    branches: [ main ]
+    tags:
+      - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -31,6 +33,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
@@ -40,44 +47,154 @@ jobs:
       - name: Install JS deps
         run: npm ci
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
+      # если у тебя Next - собери фронт заранее (или tauri-action сам соберёт)
+      - name: Build frontend (Next)
+        run: npm run build
 
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            src-tauri -> target
-
-      # Полный набор deps для Linux (GTK/WebKit/Soup + утилиты линковки)
-      - name: Install Linux deps
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libsoup-3.0-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            pkg-config \
-            patchelf
-          # WebKit2GTK: сначала 4.1, если нет в образе — 4.0
-          sudo apt-get install -y libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
-
-      # (Опционально) WebView2 для Windows рантайма ставить не нужно — Tauri подтянет
-      # macOS — без доп. зависимостей
-
-      - name: Build & Publish Release
+      - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
+        with:
+          tagName: ${{ github.ref_name }}        # используем тег как версию релиза
+          releaseName: ${{ github.ref_name }}
+          releaseDraft: true
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Collect built artifacts
+        shell: bash
+        run: |
+          mkdir -p upload
+          # соберём все релизные файлы и подписи в одну папку
+          find src-tauri/target -maxdepth 4 -type f \( \
+            -name "*.dmg" -o -name "*.msi" -o -name "*.exe" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.tar.*" -o -name "*.zip" -o -name "*.sig" \
+          \) -print -exec cp {} upload/ \; || true
+          echo "Collected:"
+          ls -la upload || true
+
+      - name: Upload artifacts (cross OS)
+        uses: actions/upload-artifact@v4
         with:
-          # Автотегирование по версии из tauri.conf.json/package.json:
-          # получится, например: v-0.1.0
-          tagName: v-__VERSION__
-          releaseName: v-__VERSION__
-          releaseBody: "Automated build from branch main: ${{ github.sha }}"
-          releaseDraft: false
-          prerelease: false
+          name: dist-${{ matrix.os }}
+          path: upload/
+
+  publish:
+    name: Publish to public updates repo
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Show tree
+        run: |
+          ls -laR dist
+
+      - name: Extract version from tag
+        id: ver
+        run: |
+          # github.ref_name = v0.0.3 → version=0.0.3
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate latest.json
+        id: latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+
+          # Найдём файлы для платформ
+          MAC_DMG="$(ls dist/**/**.dmg 2>/dev/null | head -n1 || true)"
+          WIN_MSI="$(ls dist/**/**.msi 2>/dev/null | head -n1 || true)"
+          LNX_APPIMG="$(ls dist/**/**.AppImage 2>/dev/null | head -n1 || true)"
+
+          # Подписи (у tauri .sig имеет то же имя + .sig)
+          MAC_SIG="$( [ -n "$MAC_DMG" ] && [ -f "$MAC_DMG.sig" ] && cat "$MAC_DMG.sig" || true )"
+          WIN_SIG="$( [ -n "$WIN_MSI" ] && [ -f "$WIN_MSI.sig" ] && cat "$WIN_MSI.sig" || true )"
+          LNX_SIG="$( [ -n "$LNX_APPIMG" ] && [ -f "$LNX_APPIMG.sig" ] && cat "$LNX_APPIMG.sig" || true )"
+
+          # Базовые URL (релиз в публичном репо по тегу vX.Y.Z)
+          OWNER_REPO="${{ secrets.UPDATES_REPO }}"
+          BASE_URL="https://github.com/${OWNER_REPO}/releases/download/v${VERSION}"
+
+          # Имена файлов (как они окажутся в релизе)
+          MAC_FILE="$( [ -n "$MAC_DMG" ] && basename "$MAC_DMG" || true )"
+          WIN_FILE="$( [ -n "$WIN_MSI" ] && basename "$WIN_MSI" || true )"
+          LNX_FILE="$( [ -n "$LNX_APPIMG" ] && basename "$LNX_APPIMG" || true )"
+
+          # Формируем platforms-объект
+          PLATFORMS="{}"
+          if [ -n "$MAC_FILE" ] && [ -n "$MAC_SIG" ]; then
+            PLATFORMS=$(jq -n \
+              --arg sig "$MAC_SIG" \
+              --arg url "$BASE_URL/$MAC_FILE" \
+              '{ "darwin-aarch64": { "signature": $sig, "url": $url } }')
+          fi
+          if [ -n "$WIN_FILE" ] && [ -n "$WIN_SIG" ]; then
+            PL_WIN=$(jq -n \
+              --arg sig "$WIN_SIG" \
+              --arg url "$BASE_URL/$WIN_FILE" \
+              '{ "windows-x86_64": { "signature": $sig, "url": $url } }')
+            PLATFORMS=$(jq -n --argjson a "$PLATFORMS" --argjson b "$PL_WIN" '$a + $b')
+          fi
+          if [ -n "$LNX_FILE" ] && [ -n "$LNX_SIG" ]; then
+            PL_LNX=$(jq -n \
+              --arg sig "$LNX_SIG" \
+              --arg url "$BASE_URL/$LNX_FILE" \
+              '{ "linux-x86_64": { "signature": $sig, "url": $url } }')
+            PLATFORMS=$(jq -n --argjson a "$PLATFORMS" --argjson b "$PL_LNX" '$a + $b')
+          fi
+
+          # Сгенерим latest.json
+          PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          NOTES="Auto release ${VERSION}"
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "$NOTES" \
+            --arg pub_date "$PUB_DATE" \
+            --argjson platforms "$PLATFORMS" \
+            '{ version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms }' \
+            > latest.json
+
+          echo "latest.json:"
+          cat latest.json
+
+      - name: Prepare release assets folder
+        run: |
+          mkdir -p public-release
+          cp -a dist/*/* public-release/ || true
+          cp latest.json public-release/
+          ls -la public-release
+
+      - name: Create or update release in public repo
+        env:
+          GH_TOKEN: ${{ secrets.UPDATES_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          OWNER_REPO="${{ secrets.UPDATES_REPO }}"
+
+          # Создадим релиз (если есть — не упадём)
+          gh release create "v${VERSION}" \
+            --repo "$OWNER_REPO" \
+            --title "v${VERSION}" \
+            --notes "Auto-published from private repo" \
+            || true
+
+          # Зальём ассеты (перезапишем, если уже есть)
+          for f in public-release/*; do
+            name="$(basename "$f")"
+            gh release upload "v${VERSION}" "$f" --repo "$OWNER_REPO" --clobber
+            echo "Uploaded: $name"
+          done
+
+      - name: Show public latest.json URL
+        run: |
+          echo "Public JSON endpoint:"
+          echo "https://github.com/${{ secrets.UPDATES_REPO }}/releases/latest/download/latest.json"
