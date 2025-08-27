@@ -2,10 +2,9 @@
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .setup(|_app| {
-            #[cfg(debug_assertions)]
-            {
-                _app.handle().plugin(
+        .setup(|app| {
+            if cfg!(debug_assertions) {
+                app.handle().plugin(
                     tauri_plugin_log::Builder::default()
                         .level(log::LevelFilter::Info)
                         .build(),
