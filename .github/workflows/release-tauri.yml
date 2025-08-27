@@ -61,6 +61,8 @@ jobs:
 
       - name: Build & Publish Release
         uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: main                      # Вариант A: «rolling» релиз, всегда один и тот же тег
           releaseName: "Rolling release (main)"
