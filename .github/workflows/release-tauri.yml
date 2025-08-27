@@ -1,17 +1,78 @@
 name: Release Tauri updates (public repo)
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - "v*.*.*"
+    branches: [ main ]
+  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # нужно, чтобы создать/запушить теги и релиз в этом (приватном) репо
 
 jobs:
+  prepare:
+    name: Prepare version & tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.set.outputs.tag }}
+      version: ${{ steps.set.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # нужно, чтобы видеть теги/историю
+
+      - name: Read base version from package.json
+        id: ver
+        run: |
+          if [ ! -f package.json ]; then
+            echo "package.json not found. Put version there or tweak this step."
+            exit 1
+          fi
+          BASE_VER=$(jq -r '.version' package.json)
+          if [ "$BASE_VER" = "null" ] || [ -z "$BASE_VER" ]; then
+            echo "version not found in package.json"
+            exit 1
+          fi
+          echo "base=$BASE_VER" >> $GITHUB_OUTPUT
+
+      - name: Compute next tag (auto-bump patch if exists)
+        id: set
+        run: |
+          BASE="${{ steps.ver.outputs.base }}"
+          MAJOR=$(echo "$BASE" | cut -d. -f1)
+          MINOR=$(echo "$BASE" | cut -d. -f2)
+          PATCH=$(echo "$BASE" | cut -d. -f3)
+
+          TAG="v${BASE}"
+
+          # если тег уже есть в удалённом
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}$"; then
+            NEXT_PATCH=$((PATCH + 1))
+            VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+            TAG="v${VERSION}"
+          else
+            VERSION="${BASE}"
+          fi
+
+          echo "Will use TAG=${TAG}, VERSION=${VERSION}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create and push tag (if not exists)
+        run: |
+          TAG="${{ steps.set.outputs.tag }}"
+          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}$"; then
+            echo "Tag ${TAG} already exists (either base or bumped) — skip creating."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "${TAG}" -m "Auto tag ${TAG} (CI)"
+            git push origin "${TAG}"
+          fi
+
   build:
     name: Build ${{ matrix.os }} • Tauri
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -47,15 +108,14 @@ jobs:
       - name: Install JS deps
         run: npm ci
 
-      # если у тебя Next - собери фронт заранее (или tauri-action сам соберёт)
       - name: Build frontend (Next)
         run: npm run build
 
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         with:
-          tagName: ${{ github.ref_name }}        # используем тег как версию релиза
-          releaseName: ${{ github.ref_name }}
+          tagName: ${{ needs.prepare.outputs.tag }}
+          releaseName: ${{ needs.prepare.outputs.tag }}
           releaseDraft: true
           prerelease: false
         env:
@@ -65,7 +125,6 @@ jobs:
         shell: bash
         run: |
           mkdir -p upload
-          # соберём все релизные файлы и подписи в одну папку
           find src-tauri/target -maxdepth 4 -type f \( \
             -name "*.dmg" -o -name "*.msi" -o -name "*.exe" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.tar.*" -o -name "*.zip" -o -name "*.sig" \
           \) -print -exec cp {} upload/ \; || true
@@ -80,8 +139,8 @@ jobs:
 
   publish:
     name: Publish to public updates repo
+    needs: [prepare, build]
     runs-on: ubuntu-latest
-    needs: build
 
     steps:
       - name: Download all artifacts
@@ -89,68 +148,50 @@ jobs:
         with:
           path: dist
 
-      - name: Show tree
-        run: |
-          ls -laR dist
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Extract version from tag
-        id: ver
-        run: |
-          # github.ref_name = v0.0.3 → version=0.0.3
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      - name: Show tree
+        run: ls -laR dist
 
       - name: Generate latest.json
         id: latest
         shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          OWNER_REPO: ${{ secrets.UPDATES_REPO }}  # напр. Don4ara/Next-task-updates
         run: |
           set -euo pipefail
-          VERSION="${{ steps.ver.outputs.version }}"
 
-          # Найдём файлы для платформ
           MAC_DMG="$(ls dist/**/**.dmg 2>/dev/null | head -n1 || true)"
           WIN_MSI="$(ls dist/**/**.msi 2>/dev/null | head -n1 || true)"
           LNX_APPIMG="$(ls dist/**/**.AppImage 2>/dev/null | head -n1 || true)"
 
-          # Подписи (у tauri .sig имеет то же имя + .sig)
           MAC_SIG="$( [ -n "$MAC_DMG" ] && [ -f "$MAC_DMG.sig" ] && cat "$MAC_DMG.sig" || true )"
           WIN_SIG="$( [ -n "$WIN_MSI" ] && [ -f "$WIN_MSI.sig" ] && cat "$WIN_MSI.sig" || true )"
           LNX_SIG="$( [ -n "$LNX_APPIMG" ] && [ -f "$LNX_APPIMG.sig" ] && cat "$LNX_APPIMG.sig" || true )"
 
-          # Базовые URL (релиз в публичном репо по тегу vX.Y.Z)
-          OWNER_REPO="${{ secrets.UPDATES_REPO }}"
           BASE_URL="https://github.com/${OWNER_REPO}/releases/download/v${VERSION}"
-
-          # Имена файлов (как они окажутся в релизе)
           MAC_FILE="$( [ -n "$MAC_DMG" ] && basename "$MAC_DMG" || true )"
           WIN_FILE="$( [ -n "$WIN_MSI" ] && basename "$WIN_MSI" || true )"
           LNX_FILE="$( [ -n "$LNX_APPIMG" ] && basename "$LNX_APPIMG" || true )"
 
-          # Формируем platforms-объект
           PLATFORMS="{}"
           if [ -n "$MAC_FILE" ] && [ -n "$MAC_SIG" ]; then
-            PLATFORMS=$(jq -n \
-              --arg sig "$MAC_SIG" \
-              --arg url "$BASE_URL/$MAC_FILE" \
+            PLATFORMS=$(jq -n --arg sig "$MAC_SIG" --arg url "$BASE_URL/$MAC_FILE" \
               '{ "darwin-aarch64": { "signature": $sig, "url": $url } }')
           fi
           if [ -n "$WIN_FILE" ] && [ -n "$WIN_SIG" ]; then
-            PL_WIN=$(jq -n \
-              --arg sig "$WIN_SIG" \
-              --arg url "$BASE_URL/$WIN_FILE" \
+            PL_WIN=$(jq -n --arg sig "$WIN_SIG" --arg url "$BASE_URL/$WIN_FILE" \
               '{ "windows-x86_64": { "signature": $sig, "url": $url } }')
             PLATFORMS=$(jq -n --argjson a "$PLATFORMS" --argjson b "$PL_WIN" '$a + $b')
           fi
           if [ -n "$LNX_FILE" ] && [ -n "$LNX_SIG" ]; then
-            PL_LNX=$(jq -n \
-              --arg sig "$LNX_SIG" \
-              --arg url "$BASE_URL/$LNX_FILE" \
+            PL_LNX=$(jq -n --arg sig "$LNX_SIG" --arg url "$BASE_URL/$LNX_FILE" \
               '{ "linux-x86_64": { "signature": $sig, "url": $url } }')
             PLATFORMS=$(jq -n --argjson a "$PLATFORMS" --argjson b "$PL_LNX" '$a + $b')
           fi
 
-          # Сгенерим latest.json
           PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           NOTES="Auto release ${VERSION}"
 
@@ -159,8 +200,7 @@ jobs:
             --arg notes "$NOTES" \
             --arg pub_date "$PUB_DATE" \
             --argjson platforms "$PLATFORMS" \
-            '{ version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms }' \
-            > latest.json
+            '{ version: $version, notes: $notes, pub_date: $pub_date, platforms: $platforms }' > latest.json
 
           echo "latest.json:"
           cat latest.json
@@ -174,27 +214,24 @@ jobs:
 
       - name: Create or update release in public repo
         env:
-          GH_TOKEN: ${{ secrets.UPDATES_TOKEN }}
+          GH_TOKEN: ${{ secrets.UPDATES_TOKEN }}   # PAT к публичному репо-«апдейтеру»
+          OWNER_REPO: ${{ secrets.UPDATES_REPO }}  # например Don4ara/Next-task-updates
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ steps.ver.outputs.version }}"
-          OWNER_REPO="${{ secrets.UPDATES_REPO }}"
-
-          # Создадим релиз (если есть — не упадём)
           gh release create "v${VERSION}" \
             --repo "$OWNER_REPO" \
             --title "v${VERSION}" \
             --notes "Auto-published from private repo" \
             || true
 
-          # Зальём ассеты (перезапишем, если уже есть)
           for f in public-release/*; do
-            name="$(basename "$f")"
             gh release upload "v${VERSION}" "$f" --repo "$OWNER_REPO" --clobber
-            echo "Uploaded: $name"
+            echo "Uploaded: $(basename "$f")"
           done
 
       - name: Show public latest.json URL
+        env:
+          OWNER_REPO: ${{ secrets.UPDATES_REPO }}
         run: |
-          echo "Public JSON endpoint:"
-          echo "https://github.com/${{ secrets.UPDATES_REPO }}/releases/latest/download/latest.json"
+          echo "https://github.com/${OWNER_REPO}/releases/latest/download/latest.json"
