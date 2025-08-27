@@ -34,8 +34,8 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: 20
+          cache: npm
 
       - name: Install JS deps
         run: npm ci
@@ -51,21 +51,33 @@ jobs:
           workspaces: |
             src-tauri -> target
 
+      # Полный набор deps для Linux (GTK/WebKit/Soup + утилиты линковки)
       - name: Install Linux deps
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            pkg-config \
+            patchelf
+          # WebKit2GTK: сначала 4.1, если нет в образе — 4.0
+          sudo apt-get install -y libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
 
+      # (Опционально) WebView2 для Windows рантайма ставить не нужно — Tauri подтянет
+      # macOS — без доп. зависимостей
 
       - name: Build & Publish Release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: main                      # Вариант A: «rolling» релиз, всегда один и тот же тег
-          releaseName: "Rolling release (main)"
+          # Автотегирование по версии из tauri.conf.json/package.json:
+          # получится, например: v-0.1.0
+          tagName: v-__VERSION__
+          releaseName: v-__VERSION__
           releaseBody: "Automated build from branch main: ${{ github.sha }}"
           releaseDraft: false
           prerelease: false
