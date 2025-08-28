@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # нужно, чтобы создать/запушить теги и релиз в этом (приватном) репо
+  contents: write
 
 jobs:
   prepare:
@@ -19,7 +19,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # нужно, чтобы видеть теги/историю
+          fetch-depth: 0
 
       - name: Read base version from package.json
         id: ver
@@ -62,7 +62,7 @@ jobs:
         run: |
           TAG="${{ steps.set.outputs.tag }}"
           if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}$"; then
-            echo "Tag ${TAG} already exists (either base or bumped) — skip creating."
+            echo "Tag ${TAG} already exists — skip creating."
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -110,8 +110,8 @@ jobs:
 
       - name: Install Linux deps
         if: matrix.os == 'ubuntu-latest'
-      - name: Show tree
         run: |
+          set -e
           sudo apt-get update
           sudo apt-get install -y \
             libgtk-3-dev \
@@ -122,7 +122,6 @@ jobs:
             patchelf
           # WebKit2GTK: сначала 4.1, если нет в образе — 4.0
           sudo apt-get install -y libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
-          ls -laR dist
 
       - name: Build frontend (Next)
         run: npm run build
@@ -175,7 +174,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-          OWNER_REPO: ${{ secrets.UPDATES_REPO }}  # напр. Don4ara/Next-task-updates
+          OWNER_REPO: ${{ secrets.UPDATES_REPO }}
         run: |
           set -euo pipefail
 
@@ -183,9 +182,9 @@ jobs:
           WIN_MSI="$(ls dist/**/**.msi 2>/dev/null | head -n1 || true)"
           LNX_APPIMG="$(ls dist/**/**.AppImage 2>/dev/null | head -n1 || true)"
 
-          MAC_SIG="$( [ -n "$MAC_DMG" ] && [ -f "$MAC_DMG.sig" ] && cat "$MAC_DMG.sig" || true )"
-          WIN_SIG="$( [ -n "$WIN_MSI" ] && [ -f "$WIN_MSI.sig" ] && cat "$WIN_MSI.sig" || true )"
-          LNX_SIG="$( [ -n "$LNX_APPIMG" ] && [ -f "$LNX_APPIMG.sig" ] && cat "$LNX_APPIMG.sig" || true )"
+          MAC_SIG="$( [ -n "$MAC_DMG" ] && [ -f "${MAC_DMG}.sig" ] && cat "${MAC_DMG}.sig" || true )"
+          WIN_SIG="$( [ -n "$WIN_MSI" ] && [ -f "${WIN_MSI}.sig" ] && cat "${WIN_MSI}.sig" || true )"
+          LNX_SIG="$( [ -n "$LNX_APPIMG" ] && [ -f "${LNX_APPIMG}.sig" ] && cat "${LNX_APPIMG}.sig" || true )"
 
           BASE_URL="https://github.com/${OWNER_REPO}/releases/download/v${VERSION}"
           MAC_FILE="$( [ -n "$MAC_DMG" ] && basename "$MAC_DMG" || true )"
@@ -230,8 +229,8 @@ jobs:
 
       - name: Create or update release in public repo
         env:
-          GH_TOKEN: ${{ secrets.UPDATES_TOKEN }}   # PAT к публичному репо-«апдейтеру»
-          OWNER_REPO: ${{ secrets.UPDATES_REPO }}  # например Don4ara/Next-task-updates
+          GH_TOKEN: ${{ secrets.UPDATES_TOKEN }}
+          OWNER_REPO: ${{ secrets.UPDATES_REPO }}
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
