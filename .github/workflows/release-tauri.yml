@@ -21,52 +21,38 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Read base version from package.json
+      - name: Read version from Tauri config
         id: ver
         run: |
-          if [ ! -f package.json ]; then
-            echo "package.json not found. Put version there or tweak this step."
+          if [ ! -f src-tauri/tauri.conf.json ]; then
+            echo "src-tauri/tauri.conf.json not found"
             exit 1
           fi
-          BASE_VER=$(jq -r '.version' package.json)
-          if [ "$BASE_VER" = "null" ] || [ -z "$BASE_VER" ]; then
-            echo "version not found in package.json"
+          VER=$(jq -r '.version // .app.version // .package.version' src-tauri/tauri.conf.json)
+          if [ -z "$VER" ] || [ "$VER" = "null" ]; then
+            echo "Version not found in tauri.conf.json"
             exit 1
           fi
-          echo "base=$BASE_VER" >> $GITHUB_OUTPUT
+          echo "version=$VER" >> $GITHUB_OUTPUT
 
-      - name: Compute next tag (auto-bump patch if exists)
+      - name: Set tag from version (no bump)
         id: set
         run: |
-          BASE="${{ steps.ver.outputs.base }}"
-          MAJOR=$(echo "$BASE" | cut -d. -f1)
-          MINOR=$(echo "$BASE" | cut -d. -f2)
-          PATCH=$(echo "$BASE" | cut -d. -f3)
-
-          TAG="v${BASE}"
-
-          # если тег уже есть в удалённом
-          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}$"; then
-            NEXT_PATCH=$((PATCH + 1))
-            VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
-            TAG="v${VERSION}"
-          else
-            VERSION="${BASE}"
-          fi
-
-          echo "Will use TAG=${TAG}, VERSION=${VERSION}"
+          VERSION="${{ steps.ver.outputs.version }}"
+          TAG="v${VERSION}"
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Will use TAG=${TAG}, VERSION=${VERSION}"
 
-      - name: Create and push tag (if not exists)
+      - name: Create tag if missing (no re-tag)
         run: |
           TAG="${{ steps.set.outputs.tag }}"
           if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "${TAG}$"; then
-            echo "Tag ${TAG} already exists — skip creating."
+            echo "Tag ${TAG} exists — keep it."
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag -a "${TAG}" -m "Auto tag ${TAG} (CI)"
+            git tag -a "${TAG}" -m "Release ${TAG}"
             git push origin "${TAG}"
           fi
 
@@ -120,7 +106,6 @@ jobs:
             librsvg2-dev \
             pkg-config \
             patchelf
-          # WebKit2GTK: сначала 4.1, если нет в образе — 4.0
           sudo apt-get install -y libwebkit2gtk-4.1-dev || sudo apt-get install -y libwebkit2gtk-4.0-dev
 
       - name: Build frontend (Next)
@@ -139,10 +124,22 @@ jobs:
       - name: Collect built artifacts
         shell: bash
         run: |
+          set -e
           mkdir -p upload
-          find src-tauri/target -maxdepth 4 -type f \( \
-            -name "*.dmg" -o -name "*.msi" -o -name "*.exe" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.tar.*" -o -name "*.zip" -o -name "*.sig" \
-          \) -print -exec cp {} upload/ \; || true
+          # Берём только bundle-артефакты и подписи, исключаем build_script_build*
+          find src-tauri/target -type f -path "*/bundle/*" \( \
+            -name "*.app.tar.gz" -o \
+            -name "*.dmg" -o \
+            -name "*.msi" -o \
+            -name "*_setup.exe" -o \
+            -name "*.AppImage" -o \
+            -name "*.deb" -o \
+            -name "*.rpm" -o \
+            -name "*.zip" -o \
+            -name "*.tar.*" -o \
+            -name "*.sig" \
+          \) ! -name "build_script_build*" \
+          -print -exec cp {} upload/ \; || true
           echo "Collected:"
           ls -la upload || true
 
@@ -156,7 +153,6 @@ jobs:
     name: Publish to public updates repo
     needs: [prepare, build]
     runs-on: ubuntu-latest
-
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -166,43 +162,65 @@ jobs:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Show tree
-        run: ls -laR dist
-
       - name: Generate latest.json
         id: latest
         shell: bash
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-          OWNER_REPO: ${{ secrets.UPDATES_REPO }}
+          OWNER_REPO: ${{ secrets.UPDATES_REPO }}  # напр. Don4ara/Next-task-updates
         run: |
           set -euo pipefail
 
+          # macOS: предпочтительно .app.tar.gz, иначе .dmg
+          MAC_APP_TGZ="$(ls dist/**/**.app.tar.gz 2>/dev/null | head -n1 || true)"
+          MAC_APP_TGZ_SIG="$( [ -n "$MAC_APP_TGZ" ] && [ -f "${MAC_APP_TGZ}.sig" ] && cat "${MAC_APP_TGZ}.sig" || true )"
           MAC_DMG="$(ls dist/**/**.dmg 2>/dev/null | head -n1 || true)"
-          WIN_MSI="$(ls dist/**/**.msi 2>/dev/null | head -n1 || true)"
-          LNX_APPIMG="$(ls dist/**/**.AppImage 2>/dev/null | head -n1 || true)"
+          MAC_DMG_SIG="$( [ -n "$MAC_DMG" ] && [ -f "${MAC_DMG}.sig" ] && cat "${MAC_DMG}.sig" || true )"
 
-          MAC_SIG="$( [ -n "$MAC_DMG" ] && [ -f "${MAC_DMG}.sig" ] && cat "${MAC_DMG}.sig" || true )"
-          WIN_SIG="$( [ -n "$WIN_MSI" ] && [ -f "${WIN_MSI}.sig" ] && cat "${WIN_MSI}.sig" || true )"
-          LNX_SIG="$( [ -n "$LNX_APPIMG" ] && [ -f "${LNX_APPIMG}.sig" ] && cat "${LNX_APPIMG}.sig" || true )"
+          # Windows: сначала MSI, иначе *_setup.exe
+          WIN_MSI="$(ls dist/**/**.msi 2>/dev/null | head -n1 || true)"
+          WIN_MSI_SIG="$( [ -n "$WIN_MSI" ] && [ -f "${WIN_MSI}.sig" ] && cat "${WIN_MSI}.sig" || true )"
+          WIN_EXE="$(ls dist/**/*_setup.exe 2>/dev/null | head -n1 || true)"
+          WIN_EXE_SIG="$( [ -n "$WIN_EXE" ] && [ -f "${WIN_EXE}.sig" ] && cat "${WIN_EXE}.sig" || true )"
+
+          # Linux (для апдейта): AppImage
+          LNX_APPIMG="$(ls dist/**/**.AppImage 2>/dev/null | head -n1 || true)"
+          LNX_APPIMG_SIG="$( [ -n "$LNX_APPIMG" ] && [ -f "${LNX_APPIMG}.sig" ] && cat "${LNX_APPIMG}.sig" || true )"
 
           BASE_URL="https://github.com/${OWNER_REPO}/releases/download/v${VERSION}"
-          MAC_FILE="$( [ -n "$MAC_DMG" ] && basename "$MAC_DMG" || true )"
-          WIN_FILE="$( [ -n "$WIN_MSI" ] && basename "$WIN_MSI" || true )"
-          LNX_FILE="$( [ -n "$LNX_APPIMG" ] && basename "$LNX_APPIMG" || true )"
 
           PLATFORMS="{}"
-          if [ -n "$MAC_FILE" ] && [ -n "$MAC_SIG" ]; then
-            PLATFORMS=$(jq -n --arg sig "$MAC_SIG" --arg url "$BASE_URL/$MAC_FILE" \
+
+          # macOS
+          if [ -n "$MAC_APP_TGZ" ] && [ -n "$MAC_APP_TGZ_SIG" ]; then
+            MAC_FILE="$(basename "$MAC_APP_TGZ")"
+            PL_MAC=$(jq -n --arg sig "$MAC_APP_TGZ_SIG" --arg url "$BASE_URL/$MAC_FILE" \
               '{ "darwin-aarch64": { "signature": $sig, "url": $url } }')
+            PLATFORMS=$(jq -n --argjson a "$PLATFORMS" --argjson b "$PL_MAC" '$a + $b')
+          elif [ -n "$MAC_DMG" ] && [ -n "$MAC_DMG_SIG" ]; then
+            MAC_FILE="$(basename "$MAC_DMG")"
+            PL_MAC=$(jq -n --arg sig "$MAC_DMG_SIG" --arg url "$BASE_URL/$MAC_FILE" \
+              '{ "darwin-aarch64": { "signature": $sig, "url": $url } }')
+            PLATFORMS=$(jq -n --argjson a "$PLATFORMS" --argjson b "$PL_MAC" '$a + $b')
           fi
-          if [ -n "$WIN_FILE" ] && [ -n "$WIN_SIG" ]; then
-            PL_WIN=$(jq -n --arg sig "$WIN_SIG" --arg url "$BASE_URL/$WIN_FILE" \
+
+          # Windows
+          if [ -n "$WIN_MSI" ] && [ -n "$WIN_MSI_SIG" ]; then
+            WIN_FILE="$(basename "$WIN_MSI")"
+            PL_WIN=$(jq -n --arg sig "$WIN_MSI_SIG" --arg url "$BASE_URL/$WIN_FILE" \
+              '{ "windows-x86_64": { "signature": $sig, "url": $url } }')
+            PLATFORMS=$(jq -n --argjson a "$PLATFORMS" --argjson b "$PL_WIN" '$a + $b')
+          elif [ -n "$WIN_EXE" ] && [ -n "$WIN_EXE_SIG" ]; then
+            WIN_FILE="$(basename "$WIN_EXE")"
+            PL_WIN=$(jq -n --arg sig "$WIN_EXE_SIG" --arg url "$BASE_URL/$WIN_FILE" \
               '{ "windows-x86_64": { "signature": $sig, "url": $url } }')
             PLATFORMS=$(jq -n --argjson a "$PLATFORMS" --argjson b "$PL_WIN" '$a + $b')
           fi
-          if [ -n "$LNX_FILE" ] && [ -n "$LNX_SIG" ]; then
-            PL_LNX=$(jq -n --arg sig "$LNX_SIG" --arg url "$BASE_URL/$LNX_FILE" \
+
+          # Linux
+          if [ -n "$LNX_APPIMG" ] && [ -n "$LNX_APPIMG_SIG" ]; then
+            LNX_FILE="$(basename "$LNX_APPIMG")"
+            PL_LNX=$(jq -n --arg sig "$LNX_APPIMG_SIG" --arg url "$BASE_URL/$LNX_FILE" \
               '{ "linux-x86_64": { "signature": $sig, "url": $url } }')
             PLATFORMS=$(jq -n --argjson a "$PLATFORMS" --argjson b "$PL_LNX" '$a + $b')
           fi
@@ -229,8 +247,8 @@ jobs:
 
       - name: Create or update release in public repo
         env:
-          GH_TOKEN: ${{ secrets.UPDATES_TOKEN }}
-          OWNER_REPO: ${{ secrets.UPDATES_REPO }}
+          GH_TOKEN: ${{ secrets.UPDATES_TOKEN }}   # PAT к публичному репо
+          OWNER_REPO: ${{ secrets.UPDATES_REPO }}  # например Don4ara/Next-task-updates
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
