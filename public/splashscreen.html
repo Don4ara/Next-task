@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Загрузка…</title>
+    <style>
+        :root{
+            --bg:#0b0d10;
+            --fg:#fff;
+            --mut:#9aa0a6;
+            --w:240px;   /* ширина прогресса */
+            --h:6px;     /* высота прогресса */
+            --speed:1.15s;
+        }
+        html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui}
+        .wrap{height:100%;display:grid;place-items:center}
+        .box{display:flex;flex-direction:column;align-items:center;gap:10px;padding:16px}
+        .progress{
+            width:var(--w);height:var(--h);border-radius:999px;
+            background:rgba(255,255,255,.08);overflow:hidden;position:relative;
+            box-shadow:inset 0 0 0 1px rgba(255,255,255,.04);
+        }
+        .indicator{
+            position:absolute;inset:0;height:100%;width:38%;border-radius:999px;
+            background:linear-gradient(90deg, transparent, #fff, transparent);
+            transform:translateX(-60%);opacity:.9;
+            animation:sweep var(--speed) ease-in-out infinite;
+        }
+        .hint{font-size:12px;color:var(--mut);letter-spacing:.02em}
+        @keyframes sweep{
+            0%{transform:translateX(-60%)}
+            50%{transform:translateX(120%)}
+            100%{transform:translateX(180%)}
+        }
+        @media (prefers-reduced-motion: reduce){ .indicator{animation:none} }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <div class="box" role="status" aria-live="polite">
+        <div class="progress" aria-label="Загрузка приложения">
+            <div class="indicator" aria-hidden="true"></div>
+        </div>
+        <div class="hint">Загружаем…</div>
+    </div>
+</div>
+</body>
+</html>
